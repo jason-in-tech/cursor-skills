@@ -39,9 +39,23 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 # rsync flags shared by every direction.
 # -a : archive (perms, times, symlinks, recursive)
 # -z : compress over the wire
-# --update : skip any file that is newer on the destination
+# --update : skip any file that is newer on the destination (conflict = newer wins)
+# -i : itemize changes so we can log which files actually moved
 # NO --delete : never remove files on the destination
-RSYNC_FLAGS=(-az --update)
+#
+# Excludes: keep local-only / host-specific artefacts out of the pipe.
+#   .git/         — local git backup of skills, not a skill itself
+#   _tooling/     — contains Mac-only launchd plist + macOS-absolute paths
+#   README.md     — meta-doc for the GitHub backup, not a skill
+#   .gitignore    — ditto
+#   .DS_Store     — macOS finder trash
+RSYNC_FLAGS=(-az --update -i
+  --exclude=.git/
+  --exclude=_tooling/
+  --exclude=README.md
+  --exclude=.gitignore
+  --exclude=.DS_Store
+)
 
 sync_skills_pull() {
   rsync "${RSYNC_FLAGS[@]}" -e ssh \
@@ -95,14 +109,29 @@ else:
 " 2>&1
 }
 
-# Summarise the last ~3 lines of rsync output (the "sent X bytes, received Y"
-# summary) into the log; we don't need the per-file chatter.
-log_rsync_tail() {
-  local last3
-  last3=$(tail -3)
+# Filter rsync output into something useful for the log.
+# With `-i`, rsync emits one line per file change, formatted as:
+#   >f+++++++++ path/to/file    (new file)
+#   >f.st......  path/to/file   (updated file)
+#   cd+++++++++ path/           (new dir)
+# plus the usual "sent X bytes / total size" summary at the end.
+#
+# We drop:
+#   - empty lines
+#   - cruise-shell SSH wrapper chatter (leading "✓" or "›")
+#   - the "sending/receiving incremental file list" header
+# We keep:
+#   - every file-change line (so you can see WHAT moved each hour)
+#   - the final "sent ... received ..." summary
+log_rsync_output() {
   while IFS= read -r line; do
-    [[ -n "$line" ]] && log "  $line"
-  done <<< "$last3"
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      "✓ "*|"› "*|"sending"*|"receiving"*|"Transfer starting"*) continue ;;
+      *) log "  $line" ;;
+    esac
+  done
+  return 0
 }
 
 direction="${1:-bidi}"
@@ -111,9 +140,9 @@ case "$direction" in
   bidi|"")
     log "=== Bidirectional sync: cruise <-> local ==="
     log "--- skills: pull (cruise -> local) ---"
-    sync_skills_pull | log_rsync_tail
+    sync_skills_pull | log_rsync_output
     log "--- skills: push (local -> cruise) ---"
-    sync_skills_push | log_rsync_tail
+    sync_skills_push | log_rsync_output
     log "--- mcp.json (merge from cruise) ---"
     result=$(merge_mcp_pull 2>&1 || echo "SKIPPED (cruise unreachable)")
     log "  $result"
@@ -123,7 +152,7 @@ case "$direction" in
   pull)
     log "=== Pull: cruise -> local (no deletes) ==="
     log "--- skills ---"
-    sync_skills_pull | log_rsync_tail
+    sync_skills_pull | log_rsync_output
     log "--- mcp.json (merge) ---"
     result=$(merge_mcp_pull 2>&1 || echo "SKIPPED (cruise unreachable)")
     log "  $result"
@@ -133,20 +162,27 @@ case "$direction" in
   push)
     log "=== Push: local -> cruise (no deletes) ==="
     log "--- skills ---"
-    sync_skills_push | log_rsync_tail
+    sync_skills_push | log_rsync_output
     log "=== Push complete ==="
     ;;
 
   diff)
-    echo "=== Comparing cruise vs local (dry-run, no --delete) ==="
-    echo "--- skills: what pull would do ---"
-    rsync -avzn --update -e ssh \
+    # Diff mode uses `-c` (checksum) so we only report ACTUAL content
+    # differences, not mtime drift from e.g. an editor re-saving an
+    # identical file on one side. Normal sync stays mtime-based for speed.
+    echo "=== Comparing cruise vs local (dry-run, content-diff) ==="
+    echo "--- skills: what pull would change ---"
+    rsync "${RSYNC_FLAGS[@]}" -cn -e ssh \
       "$REMOTE:$REMOTE_BASE/skills/" "$LOCAL_BASE/skills/" 2>/dev/null \
-      | grep -vE '^\.|^$|^sent|^total|^receiving|^Transfer' || echo "  (in sync)"
-    echo "--- skills: what push would do ---"
-    rsync -avzn --update -e ssh \
+      | grep -vE '^$|^sent|^total|^receiving|^Transfer|^✓|^›' \
+      | sed 's/^/  /' \
+      || echo "  (in sync)"
+    echo "--- skills: what push would change ---"
+    rsync "${RSYNC_FLAGS[@]}" -cn -e ssh \
       "$LOCAL_BASE/skills/" "$REMOTE:$REMOTE_BASE/skills/" 2>/dev/null \
-      | grep -vE '^\.|^$|^sent|^total|^receiving|^Transfer' || echo "  (in sync)"
+      | grep -vE '^$|^sent|^total|^receiving|^Transfer|^✓|^›' \
+      | sed 's/^/  /' \
+      || echo "  (in sync)"
     echo "--- mcp.json ---"
     diff <(ssh "$REMOTE" "cat $REMOTE_BASE/mcp.json 2>/dev/null" | python3 -m json.tool 2>/dev/null) \
          <(python3 -m json.tool "$LOCAL_BASE/mcp.json" 2>/dev/null) \

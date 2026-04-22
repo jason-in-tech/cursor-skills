@@ -7,7 +7,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/Users/KZFZ9H/.local/bin/cursor-sync</string>
-        <string>pull</string>
+        <string>bidi</string>
     </array>
     <key>StartInterval</key>
     <integer>3600</integer>
