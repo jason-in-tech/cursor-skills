@@ -6,7 +6,13 @@ Each subdirectory is one skill: `SKILL.md` is mandatory and carries the frontmat
 
 ## Why this repo exists
 
-Skills live at `~/.cursor/skills/<name>/SKILL.md` on disk. That directory has, on at least three separate occasions, silently lost individual skill folders without any user action (only skills created after 2026-04-16 are affected). Root cause is not yet confirmed (possibly a Cursor-side sync / cleanup hook). Until that's nailed down, this repo is the source of truth. If a skill disappears: `cd ~/.cursor/skills && git restore -- <skill>/`.
+Skills live at `~/.cursor/skills/<name>/SKILL.md` on disk. This repo is both a backup and the history log of the fix for the "disappearing skills" bug.
+
+**Root cause (confirmed 2026-04-21):** a user-level LaunchAgent (`com.cursor.sync.plist`) ran `rsync -avz --delete` every hour from `cruise:/home/yike.li/.cursor/skills/` to `~/.cursor/skills/`. The `--delete` flag obliterated every skill that existed locally but not on cruise — which is every skill created on the Mac (including `meeting-summarizer`, `meeting-research`, `wechat-chat-analysis`, and even this repo's own `.git` directory).
+
+**Fix (2026-04-21):** `_tooling/cursor-sync` now does `rsync -az --update` in both directions with **no `--delete`**. Intentional removals require the explicit `cursor-sync delete <name>` subcommand. The `_tooling/` folder contains a committed copy of the script + LaunchAgent plist so it's also backed up.
+
+If a skill disappears anyway: `cd ~/.cursor/skills && git restore -- <skill>/`.
 
 ## Skills
 

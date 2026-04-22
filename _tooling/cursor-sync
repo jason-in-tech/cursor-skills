@@ -1,0 +1,179 @@
+#!/bin/bash
+#
+# Sync Cursor skills and mcp.json between cruise VM and local.
+#
+# Usage:
+#   cursor-sync            # bidirectional: local <-> cruise (default, safe)
+#   cursor-sync pull       # cruise -> local only, no deletes
+#   cursor-sync push       # local -> cruise only, no deletes
+#   cursor-sync diff       # show what's different
+#   cursor-sync delete <name>  # remove a skill on BOTH sides (opt-in destructive)
+#
+# Design notes
+# ------------
+# The earlier version of this script used `rsync -avz --delete` one-way from
+# cruise to local every hour. That silently nuked any skill that was created
+# locally (e.g. meeting-summarizer, meeting-research, wechat-chat-analysis):
+# they existed locally but not on cruise, so --delete removed them on the
+# very next hourly pull. The symptom was "my skills keep disappearing."
+#
+# New default is bidirectional mtime-aware sync with NO --delete:
+#   - rsync -a --update  in both directions
+#   - "newer file wins" on the rare name collision
+#   - neither side ever mass-deletes anything it doesn't already know about
+#
+# If you genuinely want to retire a skill on both sides, use the explicit
+# `cursor-sync delete <name>` subcommand so the intent is logged.
+
+set -euo pipefail
+
+REMOTE="cruise"
+REMOTE_BASE="/home/yike.li/.cursor"
+LOCAL_BASE="$HOME/.cursor"
+LOG="$LOCAL_BASE/.sync.log"
+
+PATH="/Users/KZFZ9H/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
+
+# rsync flags shared by every direction.
+# -a : archive (perms, times, symlinks, recursive)
+# -z : compress over the wire
+# --update : skip any file that is newer on the destination
+# NO --delete : never remove files on the destination
+RSYNC_FLAGS=(-az --update)
+
+sync_skills_pull() {
+  rsync "${RSYNC_FLAGS[@]}" -e ssh \
+    "$REMOTE:$REMOTE_BASE/skills/" "$LOCAL_BASE/skills/" 2>&1
+}
+
+sync_skills_push() {
+  rsync "${RSYNC_FLAGS[@]}" -e ssh \
+    "$LOCAL_BASE/skills/" "$REMOTE:$REMOTE_BASE/skills/" 2>&1
+}
+
+merge_mcp_pull() {
+  local remote_mcp
+  remote_mcp=$(ssh "$REMOTE" "cat $REMOTE_BASE/mcp.json 2>/dev/null") || return 1
+
+  if [[ ! -f "$LOCAL_BASE/mcp.json" ]]; then
+    echo "$remote_mcp" > "$LOCAL_BASE/mcp.json"
+    log "mcp.json: created from remote (no local file)"
+    return 0
+  fi
+
+  python3 -c "
+import json, sys
+
+remote = json.loads('''$remote_mcp''')
+with open('$LOCAL_BASE/mcp.json') as f:
+    local = json.load(f)
+
+remote_servers = remote.get('mcpServers', {})
+local_servers = local.get('mcpServers', {})
+
+changed = False
+for name, conf in remote_servers.items():
+    if name not in local_servers:
+        local_servers[name] = conf
+        print(f'  + added: {name}', file=sys.stderr)
+        changed = True
+
+for name in list(local_servers.keys()):
+    if name not in remote_servers:
+        print(f'  ~ kept local-only: {name}', file=sys.stderr)
+
+local['mcpServers'] = local_servers
+if changed:
+    with open('$LOCAL_BASE/mcp.json', 'w') as f:
+        json.dump(local, f, indent=2)
+        f.write('\n')
+    print('UPDATED')
+else:
+    print('NO_CHANGE')
+" 2>&1
+}
+
+# Summarise the last ~3 lines of rsync output (the "sent X bytes, received Y"
+# summary) into the log; we don't need the per-file chatter.
+log_rsync_tail() {
+  local last3
+  last3=$(tail -3)
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && log "  $line"
+  done <<< "$last3"
+}
+
+direction="${1:-bidi}"
+
+case "$direction" in
+  bidi|"")
+    log "=== Bidirectional sync: cruise <-> local ==="
+    log "--- skills: pull (cruise -> local) ---"
+    sync_skills_pull | log_rsync_tail
+    log "--- skills: push (local -> cruise) ---"
+    sync_skills_push | log_rsync_tail
+    log "--- mcp.json (merge from cruise) ---"
+    result=$(merge_mcp_pull 2>&1 || echo "SKIPPED (cruise unreachable)")
+    log "  $result"
+    log "=== Sync complete ==="
+    ;;
+
+  pull)
+    log "=== Pull: cruise -> local (no deletes) ==="
+    log "--- skills ---"
+    sync_skills_pull | log_rsync_tail
+    log "--- mcp.json (merge) ---"
+    result=$(merge_mcp_pull 2>&1 || echo "SKIPPED (cruise unreachable)")
+    log "  $result"
+    log "=== Pull complete ==="
+    ;;
+
+  push)
+    log "=== Push: local -> cruise (no deletes) ==="
+    log "--- skills ---"
+    sync_skills_push | log_rsync_tail
+    log "=== Push complete ==="
+    ;;
+
+  diff)
+    echo "=== Comparing cruise vs local (dry-run, no --delete) ==="
+    echo "--- skills: what pull would do ---"
+    rsync -avzn --update -e ssh \
+      "$REMOTE:$REMOTE_BASE/skills/" "$LOCAL_BASE/skills/" 2>/dev/null \
+      | grep -vE '^\.|^$|^sent|^total|^receiving|^Transfer' || echo "  (in sync)"
+    echo "--- skills: what push would do ---"
+    rsync -avzn --update -e ssh \
+      "$LOCAL_BASE/skills/" "$REMOTE:$REMOTE_BASE/skills/" 2>/dev/null \
+      | grep -vE '^\.|^$|^sent|^total|^receiving|^Transfer' || echo "  (in sync)"
+    echo "--- mcp.json ---"
+    diff <(ssh "$REMOTE" "cat $REMOTE_BASE/mcp.json 2>/dev/null" | python3 -m json.tool 2>/dev/null) \
+         <(python3 -m json.tool "$LOCAL_BASE/mcp.json" 2>/dev/null) \
+      && echo "  (in sync)" || true
+    ;;
+
+  delete)
+    target="${2:-}"
+    if [[ -z "$target" ]]; then
+      echo "Usage: cursor-sync delete <skill-name>" >&2
+      exit 1
+    fi
+    log "=== Delete skill '$target' on BOTH sides ==="
+    if [[ -d "$LOCAL_BASE/skills/$target" ]]; then
+      rm -rf "$LOCAL_BASE/skills/$target"
+      log "  local: removed $target"
+    else
+      log "  local: $target not found"
+    fi
+    ssh "$REMOTE" "rm -rf $REMOTE_BASE/skills/$target" 2>&1 \
+      && log "  cruise: removed $target" \
+      || log "  cruise: removal failed or skill not present"
+    log "=== Delete complete ==="
+    ;;
+
+  *)
+    echo "Usage: cursor-sync [bidi|pull|push|diff|delete <name>]"
+    exit 1
+    ;;
+esac
